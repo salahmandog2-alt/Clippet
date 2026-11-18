@@ -1,4 +1,5 @@
 import os, re, time, glob, subprocess, threading, collections
+from datetime import datetime, timezone
 import requests
 import pytchat
 
@@ -12,6 +13,7 @@ PRE_SECONDS = 30
 POST_SECONDS = 10
 COOLDOWN = 60
 MAX_RUNTIME = 5.5 * 3600
+STATUS_EVERY = 30
 HYPE_WORDS = ["lmao", "lmfao", "clip", "pog", "omg", "wtf", "bruh", "💀", "😂", "🤣"]
 # -----------------------------------------
 
@@ -19,25 +21,38 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 START = time.time()
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+API = f"https://api.telegram.org/bot{TOKEN}"
+STATE = {}
 
 
 def tg_text(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg}, timeout=30)
+        r = requests.post(f"{API}/sendMessage", data={"chat_id": CHAT_ID, "text": msg}, timeout=30)
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         print("telegram text error:", e)
+        return None
+
+
+def tg_edit(msg_id, msg):
+    try:
+        requests.post(f"{API}/editMessageText",
+                      data={"chat_id": CHAT_ID, "message_id": msg_id, "text": msg}, timeout=30)
+    except Exception as e:
+        print("telegram edit error:", e)
 
 
 def tg_video(path, caption):
     try:
         with open(path, "rb") as f:
-            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendVideo",
+            r = requests.post(f"{API}/sendVideo",
                               data={"chat_id": CHAT_ID, "caption": caption},
                               files={"video": f}, timeout=300)
         print("telegram video:", r.status_code)
+        return r.status_code == 200
     except Exception as e:
         print("telegram video error:", e)
+        return False
 
 
 def find_live(handle):
@@ -94,25 +109,75 @@ def make_clip(name, buf_dir, trigger_time, n):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
                     "-i", lst, "-c", "copy", "-bsf:a", "aac_adtstoasc", out])
     if os.path.exists(out):
-        tg_video(out, f"{name} clip #{n}")
+        if tg_video(out, f"{name} clip #{n}"):
+            STATE[name]["clips"] += 1
         os.remove(out)
+
+
+def compute(times, now, s):
+    recent = [t for t in times if now - t[0] <= 10]
+    older = len(times) - len(recent)
+    baseline = (older / 110.0) * 10
+    hype_recent = sum(1 for t in recent if t[1])
+    score = len(recent) + hype_recent
+    threshold = max(s["min_msgs"], baseline * s["multiplier"])
+    return len(recent), score, threshold
+
+
+def status_text(name):
+    st = STATE[name]
+    left = max(0, int((MAX_RUNTIME - (time.time() - START)) / 60))
+    if st["last_clip"]:
+        ago = f"{int(time.time() - st['last_clip'])}s ago"
+    else:
+        ago = "none yet"
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    state = "LIVE 🔴" if st["live"] else "ended / offline"
+    return (f"📊 {name} tracker\n"
+            f"Status: {state}\n"
+            f"Chat speed: {st['rate']} msgs / 10s\n"
+            f"Score: {st['score']} (needs {st['threshold']:.0f} to clip)\n"
+            f"Clips sent: {st['clips']}\n"
+            f"Last clip: {ago}\n"
+            f"Bot time left: {left} min\n"
+            f"Updated: {now_str} UTC")
+
+
+def status_loop(name, stop):
+    msg_id = tg_text(status_text(name))
+    while not stop.is_set():
+        stop.wait(STATUS_EVERY)
+        if msg_id:
+            tg_edit(msg_id, status_text(name))
+    if msg_id:
+        tg_edit(msg_id, status_text(name))
 
 
 def run_streamer(s):
     name = s["name"]
     buf_dir = f"buffer_{name}"
+    STATE[name] = {"live": False, "rate": 0, "score": 0, "threshold": s["min_msgs"],
+                   "clips": 0, "last_clip": 0}
     n = 0
+    announced_offline = False
     while time.time() - START < MAX_RUNTIME:
         vid = find_live(s["handle"])
         if not vid:
+            if not announced_offline:
+                tg_text(f"{name} is offline. Waiting for the stream...")
+                announced_offline = True
             print(f"[{name}] not live, checking again in 60s")
             time.sleep(60)
             continue
 
+        announced_offline = False
         tg_text(f"{name} is live. Watching chat... ({vid})")
+        STATE[name]["live"] = True
         sl, ff = start_recorder(vid, buf_dir)
         stop = threading.Event()
         threading.Thread(target=cleanup_loop, args=(buf_dir, stop), daemon=True).start()
+        status_thread = threading.Thread(target=status_loop, args=(name, stop))
+        status_thread.start()
 
         chat = pytchat.create(video_id=vid)
         times = collections.deque()
@@ -121,25 +186,24 @@ def run_streamer(s):
 
         while chat.is_alive() and time.time() - START < MAX_RUNTIME:
             for c in chat.get().sync_items():
-                now = time.time()
                 hype = any(w in c.message.lower() for w in HYPE_WORDS)
-                times.append((now, hype))
-                while times and now - times[0][0] > 120:
-                    times.popleft()
-                recent = [t for t in times if now - t[0] <= 10]
-                older_count = len(times) - len(recent)
-                baseline = (older_count / 110.0) * 10
-                hype_recent = sum(1 for t in recent if t[1])
-                score = len(recent) + hype_recent
-                threshold = max(s["min_msgs"], baseline * s["multiplier"])
-                if score >= threshold and now - last_clip > COOLDOWN:
-                    last_clip = now
-                    n += 1
-                    print(f"[{name}] spike! score={score} threshold={threshold:.1f}")
-                    threading.Thread(target=make_clip, args=(name, buf_dir, now, n), daemon=True).start()
+                times.append((time.time(), hype))
+            now = time.time()
+            while times and now - times[0][0] > 120:
+                times.popleft()
+            rate, score, threshold = compute(times, now, s)
+            STATE[name].update({"rate": rate, "score": score, "threshold": threshold})
+            if score >= threshold and now - last_clip > COOLDOWN:
+                last_clip = now
+                n += 1
+                STATE[name]["last_clip"] = now
+                print(f"[{name}] spike! score={score} threshold={threshold:.1f}")
+                threading.Thread(target=make_clip, args=(name, buf_dir, now, n), daemon=True).start()
             time.sleep(1)
 
+        STATE[name]["live"] = False
         stop.set()
+        status_thread.join(timeout=60)
         sl.kill()
         ff.kill()
         tg_text(f"{name} stream ended or time limit reached.")
