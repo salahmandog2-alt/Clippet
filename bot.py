@@ -1,4 +1,4 @@
-import os, re, time, glob, subprocess, threading, collections
+import os, re, json, time, glob, subprocess, threading, collections
 from datetime import datetime, timezone
 import requests
 import pytchat
@@ -56,14 +56,29 @@ def tg_video(path, caption):
 
 
 def find_live(handle):
+    url = f"https://www.youtube.com/@{handle}/live"
     try:
-        r = requests.get(f"https://www.youtube.com/@{handle}/live", headers=UA,
+        p = subprocess.run(["streamlink", "--json", url],
+                           capture_output=True, text=True, timeout=90)
+        data = json.loads(p.stdout or "{}")
+        if data.get("streams") and not data.get("error"):
+            vid = (data.get("metadata") or {}).get("id")
+            if vid:
+                return vid
+            m = re.search(r"v=([\w-]{11})", p.stdout)
+            if m:
+                return m.group(1)
+        print("streamlink says:", str(data.get("error") or p.stderr)[:300])
+    except Exception as e:
+        print("find_live error:", e)
+    try:
+        r = requests.get(url, headers=UA,
                          cookies={"CONSENT": "YES+1", "SOCS": "CAI"}, timeout=20)
         m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([\w-]{11})"', r.text)
         if m and '"isLive":true' in r.text:
             return m.group(1)
     except Exception as e:
-        print("find_live error:", e)
+        print("find_live fallback error:", e)
     return None
 
 
