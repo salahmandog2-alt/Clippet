@@ -1,11 +1,14 @@
-import os, re, time, glob, subprocess, threading, collections
+import os, re, time, glob, subprocess, threading, collections, statistics
 from datetime import datetime, timezone
 import requests
 import pytchat
 
 # ---------------- CONFIG ----------------
 QUALITY = "720p,best"   # for 1080p use "1080p60,1080p,best"
-DEFAULT_MIN_MSGS = 60   # floor: never clip below this score
+DEFAULT_MIN_MSGS = None  # None = auto (bot learns each stream). Or a number to force a floor
+AUTO_FLOOR = 10         # auto mode: a spike must still reach at least this score
+BASELINE_WINDOW = 600   # seconds of chat history used to learn what 'normal' is
+STD_FACTOR = 3          # spike must also beat normal by this many 'wobbles'
 MULTIPLIER = 2.5        # must be this many times busier than normal (higher = pickier)
 WARMUP = 120            # seconds of learning before any clip
 PRE_SECONDS = 40
@@ -125,14 +128,19 @@ def make_clip(name, buf_dir, trigger_time, n, score):
         os.remove(out)
 
 
-def compute(times, now, min_msgs, watch_start):
+def compute(times, samples, now, min_msgs):
     recent = [t for t in times if now - t[0] <= 10]
-    older_count = len(times) - len(recent)
-    history = max(10.0, min(110.0, now - watch_start - 10))
-    baseline = (older_count / history) * 10
     hype_recent = sum(1 for t in recent if t[1])
     score = len(recent) + hype_recent
-    threshold = max(min_msgs, baseline * MULTIPLIER)
+    # remember the score history so the bot learns this stream's normal speed
+    samples.append((now, score))
+    while samples and now - samples[0][0] > BASELINE_WINDOW:
+        samples.popleft()
+    vals = [v for _, v in samples]
+    baseline = statistics.median(vals)
+    wobble = statistics.pstdev(vals) if len(vals) > 1 else 0
+    floor = AUTO_FLOOR if min_msgs is None else min_msgs
+    threshold = max(floor, baseline * MULTIPLIER, baseline + STD_FACTOR * wobble)
     return len(recent), score, threshold, baseline
 
 
@@ -176,10 +184,11 @@ def read_err(buf_dir):
 def watch(name, vid, min_msgs, stop):
     buf_dir = f"buffer_{name}"
     watch_start = time.time()
-    STATE[name] = {"live": False, "rate": 0, "score": 0, "threshold": min_msgs,
+    STATE[name] = {"live": False, "rate": 0, "score": 0, "threshold": min_msgs or AUTO_FLOOR,
                    "baseline": 0, "clips": 0, "last_clip": 0, "watch_start": watch_start}
     done = threading.Event()
     times = collections.deque()
+    samples = collections.deque()
     last_clip = 0
     n = 0
     fails = 0
@@ -247,9 +256,9 @@ def watch(name, vid, min_msgs, stop):
                     hype = any(w in c.message.lower() for w in HYPE_WORDS)
                     times.append((time.time(), hype))
                 now = time.time()
-                while times and now - times[0][0] > 120:
+                while times and now - times[0][0] > 15:
                     times.popleft()
-                rate, score, threshold, baseline = compute(times, now, min_msgs, watch_start)
+                rate, score, threshold, baseline = compute(times, samples, now, min_msgs)
                 STATE[name].update({"rate": rate, "score": score,
                                     "threshold": threshold, "baseline": baseline})
                 warmed = now - watch_start >= WARMUP
@@ -300,7 +309,7 @@ def handle_message(text):
         return
     if low.startswith("/help"):
         tg_text("Just send a YouTube live link and I'll start clipping.\n"
-                "Optional: add a name after it (Speed) and min=250 to make it less sensitive.\n"
+                "Optional: add a name after it (Speed). I learn each stream's normal chat speed on my own; add min=250 to force a higher floor.\n"
                 "Example: https://youtube.com/live/xxxx Speed min=250\n/stop stops everything.")
         return
     m = VID_RE.search(text)
@@ -327,7 +336,7 @@ def handle_message(text):
     stop = threading.Event()
     ACTIVE[name] = stop
     VIDS[name] = vid
-    tg_text(f"Got it. Starting {name} (min={min_msgs})...")
+    tg_text(f"Got it. Starting {name} (min={'auto' if min_msgs is None else min_msgs})...")
     threading.Thread(target=watch, args=(name, vid, min_msgs, stop), daemon=True).start()
 
 
@@ -361,4 +370,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                
