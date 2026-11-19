@@ -5,10 +5,11 @@ import pytchat
 
 # ---------------- CONFIG ----------------
 QUALITY = "720p,best"   # for 1080p use "1080p60,1080p,best"
-DEFAULT_MIN_MSGS = 40   # mid sensitivity for big streamers
-MULTIPLIER = 3.0
+DEFAULT_MIN_MSGS = 60   # floor: never clip below this score
+MULTIPLIER = 3.0        # must be this many times busier than normal
+WARMUP = 120            # seconds of learning before any clip
 PRE_SECONDS = 30
-POST_SECONDS = 10
+POST_SECONDS = 12
 COOLDOWN = 60
 MAX_RUNTIME = 5.5 * 3600
 STATUS_EVERY = 30
@@ -82,7 +83,7 @@ def cleanup_loop(buf_dir, done):
         done.wait(20)
 
 
-def make_clip(name, buf_dir, trigger_time, n):
+def make_clip(name, buf_dir, trigger_time, n, score):
     time.sleep(POST_SECONDS + 8)
     start, end = trigger_time - PRE_SECONDS, trigger_time + POST_SECONDS
     segs = []
@@ -101,19 +102,20 @@ def make_clip(name, buf_dir, trigger_time, n):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
                     "-i", lst, "-c", "copy", "-bsf:a", "aac_adtstoasc", out])
     if os.path.exists(out):
-        if tg_video(out, f"{name} clip #{n}"):
+        if tg_video(out, f"{name} clip #{n} (score {score})"):
             STATE[name]["clips"] += 1
         os.remove(out)
 
 
-def compute(times, now, min_msgs):
+def compute(times, now, min_msgs, watch_start):
     recent = [t for t in times if now - t[0] <= 10]
-    older = len(times) - len(recent)
-    baseline = (older / 110.0) * 10
+    older_count = len(times) - len(recent)
+    history = max(10.0, min(110.0, now - watch_start - 10))
+    baseline = (older_count / history) * 10
     hype_recent = sum(1 for t in recent if t[1])
     score = len(recent) + hype_recent
     threshold = max(min_msgs, baseline * MULTIPLIER)
-    return len(recent), score, threshold
+    return len(recent), score, threshold, baseline
 
 
 def status_text(name):
@@ -122,9 +124,13 @@ def status_text(name):
     ago = f"{int(time.time() - st['last_clip'])}s ago" if st["last_clip"] else "none yet"
     now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
     state = "LIVE 🔴" if st["live"] else "ended"
+    warm = max(0, int(WARMUP - (time.time() - st["watch_start"]))) if st["live"] else 0
+    if warm > 0:
+        state += f" (warming up, {warm}s)"
     return (f"📊 {name} tracker\n"
             f"Status: {state}\n"
             f"Chat speed: {st['rate']} msgs / 10s\n"
+            f"Normal speed: {st['baseline']:.0f} msgs / 10s\n"
             f"Score: {st['score']} (needs {st['threshold']:.0f} to clip)\n"
             f"Clips sent: {st['clips']}\n"
             f"Last clip: {ago}\n"
@@ -145,7 +151,7 @@ def status_loop(name, done):
 def watch(name, vid, min_msgs, stop):
     buf_dir = f"buffer_{name}"
     STATE[name] = {"live": False, "rate": 0, "score": 0, "threshold": min_msgs,
-                   "clips": 0, "last_clip": 0}
+                   "baseline": 0, "clips": 0, "last_clip": 0, "watch_start": time.time()}
     done = threading.Event()
     sl = ff = None
     try:
@@ -160,7 +166,7 @@ def watch(name, vid, min_msgs, stop):
             return
 
         try:
-            chat = pytchat.create(video_id=vid)
+            chat = pytchat.create(video_id=vid, interruptable=False)
         except Exception as e:
             tg_text(f"{name}: couldn't read the chat. {str(e)[:200]}")
             return
@@ -168,8 +174,10 @@ def watch(name, vid, min_msgs, stop):
             tg_text(f"{name}: chat is not available for this stream.")
             return
 
+        watch_start = time.time()
         STATE[name]["live"] = True
-        tg_text(f"{name}: stream opened. Watching chat...")
+        STATE[name]["watch_start"] = watch_start
+        tg_text(f"{name}: stream opened. Watching chat (learning for {WARMUP}s first)...")
         threading.Thread(target=cleanup_loop, args=(buf_dir, done), daemon=True).start()
         status_thread = threading.Thread(target=status_loop, args=(name, done))
         status_thread.start()
@@ -185,14 +193,17 @@ def watch(name, vid, min_msgs, stop):
             now = time.time()
             while times and now - times[0][0] > 120:
                 times.popleft()
-            rate, score, threshold = compute(times, now, min_msgs)
-            STATE[name].update({"rate": rate, "score": score, "threshold": threshold})
-            if score >= threshold and now - last_clip > COOLDOWN:
+            rate, score, threshold, baseline = compute(times, now, min_msgs, watch_start)
+            STATE[name].update({"rate": rate, "score": score,
+                                "threshold": threshold, "baseline": baseline})
+            warmed = now - watch_start >= WARMUP
+            if warmed and score >= threshold and now - last_clip > COOLDOWN:
                 last_clip = now
                 n += 1
                 STATE[name]["last_clip"] = now
                 print(f"[{name}] spike! score={score} threshold={threshold:.1f}")
-                threading.Thread(target=make_clip, args=(name, buf_dir, now, n), daemon=True).start()
+                threading.Thread(target=make_clip,
+                                 args=(name, buf_dir, now, n, score), daemon=True).start()
             time.sleep(1)
 
         STATE[name]["live"] = False
@@ -222,8 +233,8 @@ def handle_message(text):
         return
     if low.startswith("/help"):
         tg_text("Just send a YouTube live link and I'll start clipping.\n"
-                "Optional: add a name after it (Peanut) and min=60 to make it less sensitive.\n"
-                "Example: https://youtube.com/live/xxxx Peanut min=60\n/stop stops everything.")
+                "Optional: add a name after it (Speed) and min=100 to make it less sensitive.\n"
+                "Example: https://youtube.com/live/xxxx Speed min=100\n/stop stops everything.")
         return
     m = VID_RE.search(text)
     if not m:
