@@ -6,9 +6,9 @@ import pytchat
 # ---------------- CONFIG ----------------
 QUALITY = "720p,best"   # for 1080p use "1080p60,1080p,best"
 DEFAULT_MIN_MSGS = 60   # floor: never clip below this score
-MULTIPLIER = 1.6        # must be this many times busier than normal
+MULTIPLIER = 2.5        # must be this many times busier than normal (higher = pickier)
 WARMUP = 120            # seconds of learning before any clip
-PRE_SECONDS = 30
+PRE_SECONDS = 40
 POST_SECONDS = 12
 COOLDOWN = 60
 MAX_RUNTIME = 5.5 * 3600
@@ -67,10 +67,11 @@ def start_recorder(video_id, buf_dir):
                            "--stream-timeout", "120",
                            "--hls-playlist-reload-attempts", "10"],
                           stdout=subprocess.PIPE, stderr=errf)
+    prefix = f"seg_{int(time.time())}_"
     ff = subprocess.Popen([
         "ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-c", "copy",
-        "-f", "segment", "-segment_time", "5", "-strftime", "1",
-        os.path.join(buf_dir, "seg_%s.ts"),
+        "-f", "segment", "-segment_time", "5", "-reset_timestamps", "1",
+        os.path.join(buf_dir, prefix + "%05d.ts"),
     ], stdin=sl.stdout)
     return sl, ff
 
@@ -88,7 +89,7 @@ def cleanup_loop(buf_dir, done):
     while not done.is_set():
         for f in glob.glob(os.path.join(buf_dir, "seg_*.ts")):
             try:
-                if time.time() - int(re.search(r"seg_(\d+)", f).group(1)) > 180:
+                if time.time() - os.path.getmtime(f) > 180:
                     os.remove(f)
             except Exception:
                 pass
@@ -99,13 +100,18 @@ def make_clip(name, buf_dir, trigger_time, n, score):
     time.sleep(POST_SECONDS + 8)
     start, end = trigger_time - PRE_SECONDS, trigger_time + POST_SECONDS
     segs = []
-    for f in sorted(glob.glob(os.path.join(buf_dir, "seg_*.ts"))):
-        t = int(re.search(r"seg_(\d+)", f).group(1))
-        if start - 5 <= t <= end:
-            segs.append(f)
+    for f in glob.glob(os.path.join(buf_dir, "seg_*.ts")):
+        try:
+            t = os.path.getmtime(f)   # when this 5s segment was finished
+        except OSError:
+            continue
+        if start <= t <= end + 5:
+            segs.append((t, f))
+    segs = [f for t, f in sorted(segs)]
     if not segs:
         print("no segments found")
         return
+    print(f"[{name}] clip {n}: {len(segs)} segments (~{len(segs) * 5}s)")
     lst = os.path.join(buf_dir, f"list_{n}.txt")
     with open(lst, "w") as fh:
         for s in segs:
@@ -114,7 +120,7 @@ def make_clip(name, buf_dir, trigger_time, n, score):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
                     "-i", lst, "-c", "copy", "-bsf:a", "aac_adtstoasc", out])
     if os.path.exists(out):
-        if tg_video(out, f"{name} clip #{n} (score {score})"):
+        if tg_video(out, f"{name} clip #{n} (score {score}, ~{len(segs) * 5}s)"):
             STATE[name]["clips"] += 1
         os.remove(out)
 
@@ -355,4 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+                
